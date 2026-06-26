@@ -1,0 +1,85 @@
+#!/bin/bash
+# =============================================================
+# セミナー再発防止エージェント — git pre-commit フック
+# リポジトリの .git/hooks/pre-commit に配置して chmod +x
+# =============================================================
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+AGENT_SCRIPT="${SCRIPT_DIR}/tools/check_agent.py"
+
+# ステージングされたファイルを取得
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+
+# 台本・スライド・企画書が含まれているかチェック
+DOCX_FILE=""
+PPTX_FILE=""
+XLSX_FILE=""
+SESSION_NUM=""
+
+for f in $STAGED; do
+    # 台本docx
+    if [[ "$f" =~ 第([0-9]+)回.*台本.*\.docx$ ]]; then
+        DOCX_FILE="$f"
+        SESSION_NUM="${BASH_REMATCH[1]}"
+    fi
+    # スライドpptx
+    if [[ "$f" =~ 第([0-9]+)回.*資料.*\.pptx$ ]]; then
+        PPTX_FILE="$f"
+        [[ -z "$SESSION_NUM" ]] && SESSION_NUM="${BASH_REMATCH[1]}"
+    fi
+    # 企画書xlsx
+    if [[ "$f" =~ セミナー企画書\.xlsx$ ]] || [[ "$f" =~ ウェビナー_TODO.*\.xlsx$ ]]; then
+        XLSX_FILE="$f"
+    fi
+done
+
+# チェック対象のファイルがステージングされていない場合はスキップ
+if [[ -z "$DOCX_FILE" && -z "$PPTX_FILE" ]]; then
+    exit 0
+fi
+
+# 企画書のデフォルト（リポジトリルートを参照）
+if [[ -z "$XLSX_FILE" ]]; then
+    # リポジトリ内の企画書を自動検索
+    XLSX_FILE=$(find "${SCRIPT_DIR}" -name "セミナー企画書.xlsx" -o -name "ウェビナー_TODO*.xlsx" 2>/dev/null | head -1)
+fi
+
+if [[ -z "$XLSX_FILE" ]]; then
+    echo "[check_agent] 企画書xlsxが見つかりません。スキップします。"
+    exit 0
+fi
+
+echo ""
+echo "╔══════════════════════════════════════════════════╗"
+echo "║  セミナー再発防止エージェント 起動中...          ║"
+echo "╚══════════════════════════════════════════════════╝"
+
+CMD="python3 ${AGENT_SCRIPT} ${XLSX_FILE}"
+[[ -n "$DOCX_FILE" ]] && CMD="$CMD ${DOCX_FILE}"
+[[ -n "$PPTX_FILE" ]] && CMD="$CMD ${PPTX_FILE}"
+[[ -n "$SESSION_NUM" ]] && CMD="$CMD --回 ${SESSION_NUM}"
+
+echo "実行コマンド: $CMD"
+echo ""
+
+# エージェント実行
+python3 "${AGENT_SCRIPT}" \
+    "${XLSX_FILE}" \
+    ${DOCX_FILE:+"$DOCX_FILE"} \
+    ${PPTX_FILE:+"$PPTX_FILE"} \
+    ${SESSION_NUM:+--回 "$SESSION_NUM"}
+
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo "🚨 commitを中断しました。企画書と成果物の乖離を修正してから再度commitしてください。"
+    echo "   強制的にcommitする場合: git commit --no-verify"
+    echo ""
+    exit 1
+fi
+
+echo "✅ チェック完了。commitを続行します。"
+exit 0
