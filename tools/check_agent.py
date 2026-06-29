@@ -186,6 +186,24 @@ def check_deviation_with_claude(
     # 台本は長いので最初の3000文字
     script_excerpt = script_text[:3000] if script_text else "（台本なし）"
 
+    # APIに渡す前にテキストをサニタイズ（特殊文字・制御文字を除去）
+    def sanitize(text):
+        if not text:
+            return ""
+        import unicodedata
+        # 制御文字を除去（タブ・改行は保持）
+        result = "".join(c for c in text if unicodedata.category(c) != "Cc" or c in "\t\n")
+        # バックスラッシュをエスケープ
+        result = result.replace("\\", "\\\\")
+        return result[:2000]  # 長すぎる場合は切り詰め（APIトークン節約）
+
+    agenda_str     = sanitize(agenda_str)
+    composition_str = sanitize(composition_str)
+    lead_str       = sanitize(lead_str)
+    solve_str      = sanitize(solve_str)
+    script_excerpt = sanitize(script_excerpt)
+    slide_str      = sanitize(slide_str)
+
     prompt = f"""あなたはセミナー制作の品質チェック担当です。
 以下の「企画書アジェンダ・構成」と「台本・スライドの内容」を照合し、乖離・不整合を検出してください。
 
@@ -230,11 +248,12 @@ def check_deviation_with_claude(
 
 乖離がなければ "ok": true、issues: [] としてください。"""
 
+    # promptをjson.dumpsで安全にシリアライズ
     payload = json.dumps({
         "model": "claude-sonnet-4-6",
-        "max_tokens": 1000,
+        "max_tokens": 2000,
         "messages": [{"role": "user", "content": prompt}]
-    }).encode("utf-8")
+    }, ensure_ascii=False).encode("utf-8")
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     headers = {
@@ -253,8 +272,10 @@ def check_deviation_with_claude(
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = json.loads(resp.read().decode("utf-8"))
             text = body["content"][0]["text"]
-            # JSON部分だけ取り出す
-            text = re.sub(r"```json|```", "", text).strip()
+            # JSON部分だけ取り出す（マークダウンコードブロックを除去）
+            text = re.sub(r"```json\s*", "", text)
+            text = re.sub(r"```\s*", "", text)
+            text = text.strip()
             return json.loads(text)
     except Exception as e:
         return {
