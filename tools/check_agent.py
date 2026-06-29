@@ -161,6 +161,68 @@ def extract_text_from_pptx(pptx_path: str) -> list[str]:
             slides_text.append(f"[スライド{i}] " + " / ".join(texts[:5]))
     return slides_text
 
+def extract_slide_refs_from_script(script_text: str) -> list[dict]:
+    """台本から📊スライドN：タイトル の行を抽出して返す"""
+    import re
+    refs = []
+    for line in script_text.split("\n"):
+        # 「スライドN：タイトル」または「スライドN:タイトル」にマッチ
+        m = re.search(r"スライド\s*(\d+)[：::]\s*(.+)", line)
+        if m:
+            refs.append({
+                "num": int(m.group(1)),
+                "title": m.group(2).strip()
+            })
+    return refs
+
+
+def check_script_slide_alignment(script_text: str, slide_texts: list[str]) -> list[dict]:
+    """
+    台本のスライド番号とスライドファイルの枚数・タイトルを照合する。
+    戻り値：乖離リスト [{severity, description}, ...]
+    """
+    issues = []
+    script_refs = extract_slide_refs_from_script(script_text)
+
+    if not script_refs:
+        return []  # 台本にスライド番号がない場合はスキップ
+
+    slide_count = len(slide_texts)
+    script_max = max(r["num"] for r in script_refs) if script_refs else 0
+
+    # 枚数チェック
+    if slide_texts and script_max != slide_count:
+        issues.append({
+            "severity": "高",
+            "description": (
+                f"台本のスライド番号の最大値（S{script_max}）と"
+                f"スライドファイルの枚数（{slide_count}枚）が一致しない。"
+                f"台本のスライド番号を修正するか、スライドファイルを更新してください。"
+            )
+        })
+
+    # 重複番号チェック
+    nums = [r["num"] for r in script_refs]
+    duplicates = [n for n in set(nums) if nums.count(n) > 1]
+    if duplicates:
+        issues.append({
+            "severity": "中",
+            "description": f"台本にスライド番号の重複があります：S{sorted(duplicates)}"
+        })
+
+    # 番号の連続性チェック（飛び番）
+    if script_refs:
+        unique_nums = sorted(set(nums))
+        expected = list(range(1, unique_nums[-1] + 1))
+        missing = [n for n in expected if n not in unique_nums]
+        if missing:
+            issues.append({
+                "severity": "低",
+                "description": f"台本でスキップされているスライド番号：{missing}"
+            })
+
+    return issues
+
 
 # ─────────────────────────────────────────────
 # 2. Claude API で乖離チェック
@@ -395,9 +457,25 @@ def main():
     print(f"  → 台本テキスト: {len(script_text)}文字")
     print(f"  → スライド枚数: {len(slide_texts)}枚")
 
+    # 台本↔スライド対応チェック（ローカル・高速）
+    alignment_issues = check_script_slide_alignment(script_text, slide_texts)
+    if alignment_issues:
+        print(f"[台本↔スライド照合] ⚠️ {len(alignment_issues)}件の対応ズレを検出")
+        for iss in alignment_issues:
+            print(f"  [{iss['severity']}] {iss['description']}")
+    else:
+        if slide_texts:
+            print("[台本↔スライド照合] ✅ スライド番号の対応OK")
+
     # Claude API でチェック
     print("[2/3] Claude API でチェック中...")
     result = check_deviation_with_claude(agenda_data, script_text, slide_texts, session_label)
+
+    # alignment_issuesをresultにマージ
+    if alignment_issues:
+        result["issues"] = alignment_issues + result.get("issues", [])
+        result["ok"] = False
+        result["summary"] = f"台本↔スライド対応ズレ{len(alignment_issues)}件を含む。" + result.get("summary", "")
 
     # 結果表示
     print("\n─── チェック結果 ───")
