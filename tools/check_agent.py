@@ -40,6 +40,9 @@ def extract_agenda_from_xlsx(xlsx_path: str, session_num: int = None) -> dict:
         "speaker": "",
         "target": "",
         "agenda_items": [],
+        "composition": "",   # 構成欄（台本生成の詳細指示）
+        "lead_text": "",     # リード文
+        "solve_issues": "",  # 解決できる課題
         "raw_text": []
     }
 
@@ -90,12 +93,25 @@ def extract_agenda_from_xlsx(xlsx_path: str, session_num: int = None) -> dict:
                 if line and re.match(r'^[①②③④⑤⑥⑦⑧⑨⑩\d]', line):
                     result["agenda_items"].append(line)
 
-        # 構成行（バックアップ：アジェンダが取れない場合）
-        if first == "構成" and not result["agenda_items"] and second:
-            for line in second.split("\n"):
-                line = line.strip()
-                if line and re.match(r'^[①②③④⑤⑥⑦⑧⑨⑩\d]', line):
-                    result["agenda_items"].append(line)
+        # 構成欄（常に取得・台本生成の詳細指示として使う）
+        if "構成" in first and "ページ" in first and second:
+            result["composition"] = second
+        elif first == "構成" and second:
+            result["composition"] = second
+            # アジェンダが取れていない場合は構成欄から補完
+            if not result["agenda_items"]:
+                for line in second.split("\n"):
+                    line = line.strip()
+                    if line and re.match(r'^[①②③④⑤⑥⑦⑧⑨⑩\d]', line):
+                        result["agenda_items"].append(line)
+
+        # リード文
+        if "リード文" in first and second:
+            result["lead_text"] = second[:300]
+
+        # 解決できる課題
+        if "解決できる課題" in first and second:
+            result["solve_issues"] = second[:300]
 
     wb.close()
     return result
@@ -163,12 +179,15 @@ def check_deviation_with_claude(
     import urllib.request
 
     agenda_str = "\n".join(f"  - {item}" for item in agenda_data["agenda_items"]) or "（取得できませんでした）"
+    composition_str = agenda_data.get("composition", "")
+    lead_str = agenda_data.get("lead_text", "")
+    solve_str = agenda_data.get("solve_issues", "")
     slide_str = "\n".join(slide_texts[:30]) if slide_texts else "（スライドなし）"
     # 台本は長いので最初の3000文字
     script_excerpt = script_text[:3000] if script_text else "（台本なし）"
 
     prompt = f"""あなたはセミナー制作の品質チェック担当です。
-以下の「企画書アジェンダ」と「台本・スライドの内容」を照合し、乖離・不整合を検出してください。
+以下の「企画書アジェンダ・構成」と「台本・スライドの内容」を照合し、乖離・不整合を検出してください。
 
 ## 対象セミナー
 {session_label}
@@ -177,6 +196,15 @@ def check_deviation_with_claude(
 
 ## 企画書のアジェンダ（正とする）
 {agenda_str}
+
+## 企画書の構成欄（台本の詳細指示）
+{composition_str if composition_str else "（記載なし）"}
+
+## 企画書のリード文（ターゲットの課題感）
+{lead_str if lead_str else "（記載なし）"}
+
+## 企画書の解決できる課題
+{solve_str if solve_str else "（記載なし）"}
 
 ## 台本の冒頭抜粋（最初3000文字）
 {script_excerpt}
@@ -187,7 +215,9 @@ def check_deviation_with_claude(
 ## 判定基準
 1. 台本・スライドに、企画書のアジェンダにない章・トピックが含まれていないか？
 2. 企画書のアジェンダ項目が台本・スライドで欠落していないか？
-3. 登壇者・テーマが台本・スライドと一致しているか？
+3. 企画書の構成欄の指示（登壇形式・各章の内容指示）が台本に反映されているか？
+4. 企画書のリード文・解決できる課題が台本の内容にカバーされているか？
+5. 登壇者・テーマが台本・スライドと一致しているか？
 
 ## 出力形式（JSONのみ・マークダウン不要）
 {{
