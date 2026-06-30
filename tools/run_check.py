@@ -68,6 +68,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Slack通知なしで実行")
     parser.add_argument("--slack-webhook", default=os.environ.get("SLACK_WEBHOOK_URL", ""), help="Slack Webhook URL")
     parser.add_argument("--auto-push", action="store_true", help="チェックOK時に自動でgit add/commit/pushする")
+    parser.add_argument("--skip-slide-check", action="store_true", help="スライドファイルなしでもpre-flight checkをスキップして続行")
     parser.add_argument("--commit-msg", default=None, help="git commitメッセージ（省略時は自動生成）")
     args = parser.parse_args()
 

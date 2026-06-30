@@ -397,6 +397,138 @@ def check_deviation_with_claude(
 # 3. Slack通知
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# 4. 自動再発防止ロジック
+# ─────────────────────────────────────────────
+
+def auto_fix_add_detection(issues: list[dict], agent_path: str) -> list[str]:
+    """
+    検出された問題のうち、まだcheck_agent.pyに検出ロジックがないものを
+    Claude APIを使って自動生成し、check_agent.pyに追記する。
+    戻り値：追加した検出ロジックの説明リスト
+    """
+    import urllib.request, json, os, re
+
+    if not issues:
+        return []
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return []
+
+    agent_code = open(agent_path).read()
+    added = []
+
+    for issue in issues:
+        # severity=高 のみ自動修正対象
+        if issue.get("severity") != "高":
+            continue
+
+        desc = issue.get("description", "")
+
+        # 既にcheck_agentに類似の検出ロジックがあるか確認
+        prompt = f"""あなたはPythonエンジニアです。
+以下のcheck_agent.pyに、下記の問題を検出するロジックがすでに含まれているか確認してください。
+
+## 検出したい問題
+{desc}
+
+## check_agent.pyの現在のコード（抜粋）
+{agent_code[:6000]}
+
+## 回答形式（JSONのみ）
+{{"already_exists": true/false, "reason": "理由を1行で"}}
+"""
+
+        try:
+            payload = json.dumps({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}]
+            }, ensure_ascii=False).encode("utf-8")
+
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "x-api-key": api_key
+                }
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                text = body["content"][0]["text"]
+                text = re.sub(r"```json\s*", "", text)
+                text = re.sub(r"```\s*", "", text)
+                check = json.loads(text.strip())
+
+            if check.get("already_exists"):
+                continue
+
+            # 新しい検出ロジックをClaude APIで生成
+            fix_prompt = f"""あなたはPythonエンジニアです。
+以下の問題を検出するPython関数を1つ書いてください。
+
+## 検出したい問題
+{desc}
+
+## 関数の仕様
+- 関数名: check_auto_[問題を表す英語スネークケース]
+- 引数: script_text: str, slide_texts: list[str], agenda_data: dict
+- 戻り値: list[dict] （各dictは {{"severity": "高"/"中"/"低", "description": "問題の説明"}} の形式）
+- 問題がなければ空リストを返す
+- シンプルに、文字列マッチングや数値比較だけで実装する
+- Claude API呼び出しは不要
+
+Pythonコードのみ出力してください。説明不要。
+```python
+def check_auto_...
+```
+"""
+            payload2 = json.dumps({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 800,
+                "messages": [{"role": "user", "content": fix_prompt}]
+            }, ensure_ascii=False).encode("utf-8")
+
+            req2 = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=payload2,
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "x-api-key": api_key
+                }
+            )
+            with urllib.request.urlopen(req2, timeout=30) as resp2:
+                body2 = json.loads(resp2.read().decode("utf-8"))
+                new_code = body2["content"][0]["text"]
+                # コードブロックを取り出す
+                m = re.search(r"```python\n(.+?)```", new_code, re.DOTALL)
+                if m:
+                    new_code = m.group(1)
+
+            # check_agent.pyの末尾（if __name__ の前）に追記
+            insert_marker = "\nif __name__ == \"__main__\":"
+            if insert_marker in agent_code and new_code.strip().startswith("def check_auto_"):
+                updated = agent_code.replace(
+                    insert_marker,
+                    f"\n\n# [自動追加 再発防止ロジック]\n{new_code}\n{insert_marker}"
+                )
+                open(agent_path, 'w').write(updated)
+                agent_code = updated  # 次のループで最新コードを参照
+                func_name = re.search(r"def (check_auto_\w+)", new_code)
+                fname = func_name.group(1) if func_name else "unknown"
+                added.append(f"{fname}：{desc[:50]}")
+
+        except Exception as e:
+            print(f"[auto-fix] スキップ（{e}）")
+            continue
+
+    return added
+
+
 def notify_slack(webhook_url: str, result: dict, session_label: str, files: dict):
     """乖離チェック結果をSlackに投稿する"""
     import urllib.request
@@ -474,6 +606,20 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Slack通知せず結果をターミナルに出力")
     args = parser.parse_args()
 
+    # ─── pre-flight check ───
+    # スライドファイルなしで台本生成→チェックしようとしていないか警告
+    if not args.pptx:
+        print("[pre-flight] ⚠️  スライドファイルが指定されていません。")
+        print("             スライドを先に完成させてから台本チェックを行うことを推奨します。")
+        print("             スライドなしで続行する場合は --skip-slide-check を追加してください。")
+        # --skip-slide-check がない場合は確認を求める（CI環境では自動スキップ）
+        import sys as _sys
+        if '--skip-slide-check' not in _sys.argv and not os.environ.get("CI"):
+            ans = input("             スライドなしで続行しますか？ [y/N]: ").strip().lower()
+            if ans != 'y':
+                print("[pre-flight] 中断しました。スライドファイルを用意してから再実行してください。")
+                sys.exit(1)
+
     # ファイル存在確認
     for path, label in [(args.xlsx, "企画書"), (args.docx, "台本")]:
         if not Path(path).exists():
@@ -543,6 +689,28 @@ def main():
             print(f"  [{issue['severity']}] {issue['description']}")
     print(f"サマリー: {result['summary']}")
     print("─────────────────────\n")
+
+    # ─── 自動再発防止ロジック追加 ───
+    if not result["ok"]:
+        high_issues = [i for i in result["issues"] if i["severity"] == "高"]
+        if high_issues:
+            print("[auto-fix] 高severityの問題を検出。再発防止ロジックを自動追加します...")
+            agent_path = os.path.abspath(__file__)
+            added = auto_fix_add_detection(high_issues, agent_path)
+            if added:
+                print(f"[auto-fix] ✅ {len(added)}件の検出ロジックを追加しました：")
+                for a in added:
+                    print(f"  - {a}")
+                # 更新したcheck_agent.pyをgit add
+                import subprocess
+                try:
+                    subprocess.run(["git", "-C", str(Path(agent_path).parent.parent),
+                                    "add", agent_path], check=False)
+                    print("[auto-fix] git add 完了")
+                except Exception:
+                    pass
+            else:
+                print("[auto-fix] 既存ロジックで対応済み（追加不要）")
 
     # Slack通知
     files_info = {"企画書": args.xlsx, "台本": args.docx}
