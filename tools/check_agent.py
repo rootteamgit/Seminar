@@ -595,6 +595,115 @@ def notify_slack(webhook_url: str, result: dict, session_label: str, files: dict
 # 4. メイン
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# 5. 文字数の事前設計・事後チェック（台本生成の継ぎ足しループ防止）
+# ─────────────────────────────────────────────
+
+def calculate_target_chars(agenda_data: dict, chars_per_minute: int = 400) -> dict:
+    """
+    企画書のアジェンダ（各章の分数）から、各章の目標文字数を逆算する。
+    台本生成の「最初」に必ず呼び出し、目標文字数を渡してから書き始めること。
+
+    引数:
+        agenda_data: extract_agenda_from_xlsx() の戻り値。
+                     agenda_data["agenda"] に「①イントロ（3分）」のような文字列を想定。
+        chars_per_minute: 1分あたりの目安文字数（日本語の自然な話速）
+
+    戻り値:
+        {
+            "sections": [{"title": "①イントロ", "minutes": 3, "target_chars": 1200}, ...],
+            "total_minutes": 30,
+            "total_target_chars": 12000
+        }
+    """
+    import re
+
+    agenda_text = agenda_data.get("agenda", "") if isinstance(agenda_data, dict) else str(agenda_data)
+    if not agenda_text:
+        return {"sections": [], "total_minutes": 0, "total_target_chars": 0}
+
+    # 「①〜⑥」などの章区切り＋「（N分）」を抽出
+    pattern = r"([①②③④⑤⑥⑦⑧⑨][^（()]*)[（(](\d+)分[）)]"
+    matches = re.findall(pattern, agenda_text)
+
+    sections = []
+    total_minutes = 0
+    for title_part, minutes_str in matches:
+        minutes = int(minutes_str)
+        total_minutes += minutes
+        sections.append({
+            "title": title_part.strip(),
+            "minutes": minutes,
+            "target_chars": minutes * chars_per_minute,
+        })
+
+    return {
+        "sections": sections,
+        "total_minutes": total_minutes,
+        "total_target_chars": total_minutes * chars_per_minute,
+    }
+
+
+def check_section_lengths(script_text: str, targets: dict, tolerance: float = 0.15) -> list[dict]:
+    """
+    台本生成「後」に一度だけ呼び出し、各章の実際の文字数と目標文字数の差分を
+    まとめて算出する。これにより「測っては継ぎ足す」の繰り返しループを防ぐ。
+
+    引数:
+        script_text: 生成済みの台本全文
+        targets: calculate_target_chars() の戻り値
+        tolerance: 許容誤差（デフォルト15%）。これを超える不足/超過のみ報告する。
+
+    戻り値:
+        [{"severity": "中", "description": "②章があと800字不足（目標2000字・実際1200字）"}, ...]
+        過不足がtolerance以内に収まっていれば空リストを返す。
+    """
+    import re
+
+    issues = []
+    if not targets.get("sections"):
+        return issues
+
+    # 章ごとにテキストを分割（次の章見出し or 文末まで）
+    section_titles = [s["title"] for s in targets["sections"]]
+    # 各章見出しの出現位置を探す
+    positions = []
+    for title in section_titles:
+        # タイトルの先頭の丸数字記号だけで緩く検索（本文の表記揺れに対応）
+        marker = title[0]  # ①②③...
+        idx = script_text.find(marker)
+        positions.append(idx if idx != -1 else None)
+
+    for i, sec in enumerate(targets["sections"]):
+        start = positions[i]
+        end = positions[i + 1] if i + 1 < len(positions) and positions[i + 1] is not None else len(script_text)
+        if start is None:
+            issues.append({
+                "severity": "中",
+                "description": f"{sec['title']}の章見出しが台本内に見つかりません。文字数チェックをスキップしました。"
+            })
+            continue
+
+        section_text = script_text[start:end]
+        actual_chars = len(re.sub(r"\s", "", section_text))
+        target_chars = sec["target_chars"]
+        diff = actual_chars - target_chars
+        diff_ratio = abs(diff) / target_chars if target_chars > 0 else 0
+
+        if diff_ratio > tolerance:
+            direction = "超過" if diff > 0 else "不足"
+            issues.append({
+                "severity": "中",
+                "description": (
+                    f"{sec['title']}（目標{sec['minutes']}分・{target_chars}字）が"
+                    f"実際{actual_chars}字で、{abs(diff)}字{direction}しています。"
+                    f"{'削って' if diff > 0 else '追記して'}目標分量に近づけてください。"
+                )
+            })
+
+    return issues
+
+
 def main():
     parser = argparse.ArgumentParser(description="セミナー再発防止エージェント")
     parser.add_argument("xlsx",   help="企画書 .xlsx のパス")
@@ -668,12 +777,22 @@ def main():
         if slide_texts:
             print("[台本↔スライド照合] ✅ スライド番号の対応OK")
 
+    # 文字数の事前設計に対する事後チェック（継ぎ足しループ防止）
+    char_targets = calculate_target_chars(agenda_data)
+    length_issues = check_section_lengths(script_text, char_targets)
+    if length_issues:
+        print(f"[文字数チェック] ⚠️ {len(length_issues)}件の章で目標分量から乖離")
+        for iss in length_issues:
+            print(f"  [{iss['severity']}] {iss['description']}")
+    elif char_targets.get("sections"):
+        print(f"[文字数チェック] ✅ 全章とも目標分量の範囲内（目標合計{char_targets['total_target_chars']}字）")
+
     # Claude API でチェック
     print("[2/3] Claude API でチェック中...")
     result = check_deviation_with_claude(agenda_data, script_text, slide_texts, session_label)
 
     # alignment_issues・version_issuesをresultにマージ
-    all_local_issues = version_issues + alignment_issues
+    all_local_issues = version_issues + alignment_issues + length_issues
     if all_local_issues:
         result["issues"] = all_local_issues + result.get("issues", [])
         result["ok"] = False
