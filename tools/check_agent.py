@@ -210,16 +210,62 @@ def check_script_slide_alignment(script_text: str, slide_texts: list[str]) -> li
             "description": f"台本にスライド番号の重複があります：S{sorted(duplicates)}"
         })
 
-    # 番号の連続性チェック（飛び番）
+    # 番号の連続性チェック（飛び番）→ セリフなしスライドの可能性があるため[高]
     if script_refs:
         unique_nums = sorted(set(nums))
         expected = list(range(1, unique_nums[-1] + 1))
         missing = [n for n in expected if n not in unique_nums]
         if missing:
             issues.append({
-                "severity": "低",
-                "description": f"台本でスキップされているスライド番号：{missing}"
+                "severity": "高",
+                "description": (
+                    f"台本にスライド番号の飛び番があります：S{missing}。"
+                    f"これらのスライドに対応するセリフが台本に存在しない可能性があります。"
+                    f"各スライドの切り替えタイミングで話す内容が台本に含まれているか確認してください。"
+                )
             })
+
+    # 台本バージョン番号チェック（タイトル行のv番号が古くないか）
+    import re
+    version_match = re.search(r"台本（v(\d+)）", script_text)
+    if version_match:
+        # バージョン番号が取得できた場合、ファイル名と一致するかは呼び出し側で確認
+        # ここでは記録のみ（将来的にファイル名と照合する拡張ポイント）
+        pass
+
+    return issues
+
+
+def check_script_version_title(script_text: str, docx_path: str) -> list[dict]:
+    """
+    台本内部のタイトル（v番号）とファイル名のv番号が一致するかチェック。
+    例：ファイル名が _v8.docx なのに内部タイトルが（v7）なら[中]で検出。
+    """
+    import re, os
+    issues = []
+
+    # ファイル名からバージョン番号を抽出
+    filename = os.path.basename(docx_path)
+    file_ver_m = re.search(r"_v(\d+)\.docx", filename)
+    if not file_ver_m:
+        return issues
+    file_ver = int(file_ver_m.group(1))
+
+    # 台本テキストから内部タイトルのバージョン番号を抽出
+    title_ver_m = re.search(r"台本（v(\d+)）", script_text)
+    if not title_ver_m:
+        return issues
+    title_ver = int(title_ver_m.group(1))
+
+    if file_ver != title_ver:
+        issues.append({
+            "severity": "中",
+            "description": (
+                f"ファイル名のバージョン（v{file_ver}）と"
+                f"台本内部タイトルのバージョン（v{title_ver}）が一致しない。"
+                f"台本の冒頭タイトルを「台本（v{file_ver}）」に更新してください。"
+            )
+        })
 
     return issues
 
@@ -457,6 +503,15 @@ def main():
     print(f"  → 台本テキスト: {len(script_text)}文字")
     print(f"  → スライド枚数: {len(slide_texts)}枚")
 
+    # 台本バージョン番号チェック（ファイル名と内部タイトルの一致）
+    version_issues = check_script_version_title(script_text, args.docx)
+    if version_issues:
+        print(f"[バージョン番号チェック] ⚠️ {len(version_issues)}件の不一致を検出")
+        for iss in version_issues:
+            print(f"  [{iss['severity']}] {iss['description']}")
+    else:
+        print("[バージョン番号チェック] ✅ バージョン番号OK")
+
     # 台本↔スライド対応チェック（ローカル・高速）
     alignment_issues = check_script_slide_alignment(script_text, slide_texts)
     if alignment_issues:
@@ -471,11 +526,12 @@ def main():
     print("[2/3] Claude API でチェック中...")
     result = check_deviation_with_claude(agenda_data, script_text, slide_texts, session_label)
 
-    # alignment_issuesをresultにマージ
-    if alignment_issues:
-        result["issues"] = alignment_issues + result.get("issues", [])
+    # alignment_issues・version_issuesをresultにマージ
+    all_local_issues = version_issues + alignment_issues
+    if all_local_issues:
+        result["issues"] = all_local_issues + result.get("issues", [])
         result["ok"] = False
-        result["summary"] = f"台本↔スライド対応ズレ{len(alignment_issues)}件を含む。" + result.get("summary", "")
+        result["summary"] = f"ローカルチェック{len(all_local_issues)}件。" + result.get("summary", "")
 
     # 結果表示
     print("\n─── チェック結果 ───")
