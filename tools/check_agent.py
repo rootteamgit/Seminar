@@ -24,6 +24,65 @@ from datetime import datetime
 # 1. テキスト抽出
 # ─────────────────────────────────────────────
 
+def fetch_xlsx_from_google_drive(file_id: str) -> str:
+    """
+    Google Drive APIでスプレッドシートをxlsxとしてダウンロードし、
+    ローカルの一時ファイルパスを返す。
+
+    従来のread_file_contentはgid（シート）指定に対応していないため、
+    download_file_contentでxlsx全体を取得してopenpyxlで特定シートを読む方式を採用。
+
+    引数:
+        file_id: Google DriveのファイルID（URLの /d/{file_id}/ の部分）
+
+    戻り値:
+        ローカルに保存したxlsxのパス（一時ファイル）
+    """
+    import urllib.request, base64, json, os, tempfile
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY が未設定です。")
+
+    # Claude APIを経由してGoogle Drive MCPを呼び出す
+    # ※ このエージェント内での直接呼び出しは不可。
+    # 代わりに、呼び出し元（run_check.py）でxlsxを事前取得することを推奨。
+    # この関数は将来的なMCP統合のためのプレースホルダー。
+    raise NotImplementedError(
+        "Google Drive MCPの直接呼び出しはcheck_agent.pyからはできません。\n"
+        "run_check.py で --gdrive-file-id オプションを使ってxlsxを事前ダウンロードしてください。"
+    )
+
+
+def download_gdrive_xlsx(file_id: str, dest_path: str) -> str:
+    """
+    Google Driveスプレッドシートをxlsxとしてダウンロードしてローカルに保存する。
+    check_agent.pyの外部（run_check.py）から呼び出す想定。
+
+    引数:
+        file_id: Google DriveのファイルID
+        dest_path: 保存先パス（例: /tmp/seminar_kikakusho.xlsx）
+
+    使用方法（run_check.py内）:
+        import base64, json, re
+        # 1. Google Drive:download_file_content ツールでfile_idを指定してxlsxを取得
+        # 2. レスポンスのbase64コンテンツをデコードしてdest_pathに保存
+        # 3. extract_agenda_from_xlsx(dest_path, session_num) を呼び出す
+
+    注意:
+        - Google Drive MCPコネクタがONになっている必要がある
+        - exportMimeType に application/vnd.openxmlformats-officedocument.spreadsheetml.sheet を指定
+    """
+    # この関数自体はrun_check.pyで実装する（MCPツール呼び出しは外部から）
+    # ここではパスを返すだけのシム
+    if not os.path.exists(dest_path):
+        raise FileNotFoundError(
+            f"xlsxファイルが見つかりません: {dest_path}\n"
+            f"run_check.py の --gdrive-file-id オプションでGoogle Driveから事前ダウンロードしてください。"
+        )
+    return dest_path
+
+
 def extract_agenda_from_xlsx(xlsx_path: str, session_num: int = None) -> dict:
     """
     企画書xlsxからアジェンダを抽出する。
@@ -31,8 +90,14 @@ def extract_agenda_from_xlsx(xlsx_path: str, session_num: int = None) -> dict:
       - シート「企画書」またはシート名に回数を含む
       - 「アジェンダ」行を探して以降の項目を取得
       - 「テーマ」「登壇者」「ターゲット」も取得
+
+    Google Drive対応:
+      - read_file_contentはgid指定に対応していないため、
+        download_file_contentでxlsx全体を取得してopenpyxlで特定シートを読む方式を使う
+      - run_check.py で --gdrive-file-id を指定するとxlsxを自動ダウンロードする
     """
     import openpyxl
+    import os
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
 
     result = {

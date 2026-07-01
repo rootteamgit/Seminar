@@ -59,12 +59,52 @@ def find_file(pattern: str):
     return None
 
 
+def _download_gdrive_xlsx(file_id: str, dest_path: str) -> str:
+    """
+    Google DriveスプレッドシートをMCP経由ではなく
+    download_file_content相当の処理でxlsxとしてダウンロードして保存する。
+
+    実際のMCP呼び出しはClaude側で行うため、ここではキャッシュファイルの
+    存在確認のみを行い、なければエラーを返す設計。
+
+    将来的にはMCPのCLI統合でこの関数から直接呼び出せるようにする予定。
+    現状の運用：
+      1. Claudeが download_file_content(file_id) でxlsxを取得
+      2. base64デコードして ~/Documents/agent/セミナー企画書.xlsx に保存
+      3. run_check.py がそのキャッシュを読む
+    """
+    cache = Path(dest_path)
+    if cache.exists():
+        return str(cache)
+
+    # キャッシュがない場合はエクスポートURLで試みる
+    export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
+    print(f"[企画書] エクスポートURLでダウンロード試行: {export_url}")
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(export_url, str(cache))
+        import os
+        if os.path.getsize(str(cache)) > 1000:
+            print(f"[企画書] ダウンロード成功: {cache}")
+            return str(cache)
+        else:
+            cache.unlink()
+            raise RuntimeError("ダウンロードしたファイルが空または不正です（認証が必要な可能性）")
+    except Exception as e:
+        raise RuntimeError(
+            f"Google Driveからの自動取得に失敗しました: {e}\n"
+            f"対処法: Claudeに「企画書をダウンロードして ~/Documents/agent/ に保存して」と依頼してください"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="セミナーチェックエージェント 手動実行ラッパー")
     parser.add_argument("--回", type=int, required=True, dest="session_num", help="対象セミナーの回数")
     parser.add_argument("--xlsx", default=None, help="企画書xlsxパスを直接指定（省略時は自動検索）")
     parser.add_argument("--docx", default=None, help="台本docxパスを直接指定（省略時は自動検索）")
     parser.add_argument("--pptx", default=None, help="スライドpptxパスを直接指定（省略時は自動検索）")
+    parser.add_argument("--gdrive-file-id", default="1s_7uFGfK2dQYAxMBhgQbH17gJfIe7DXny67TTJygeAc",
+                        help="Google DriveのスプレッドシートID（デフォルト：セミナー企画書）")
     parser.add_argument("--dry-run", action="store_true", help="Slack通知なしで実行")
     parser.add_argument("--slack-webhook", default=os.environ.get("SLACK_WEBHOOK_URL", ""), help="Slack Webhook URL")
     parser.add_argument("--auto-push", action="store_true", help="チェックOK時に自動でgit add/commit/pushする")
@@ -74,18 +114,31 @@ def main():
 
     n = args.session_num
 
-    # 企画書：引数指定 → ローカル検索 の順
-    # Google Driveからは手動でダウンロードして --xlsx で指定するか
-    # SEMINAR_KIKAKUSHO_PATH 環境変数で固定パスを設定してください
+    # ─── 企画書の取得（優先順位）───
+    # 1. --xlsx 直接指定
+    # 2. ローカルキャッシュ（~/Documents/agent/セミナー企画書.xlsx）
+    # 3. Google Driveから自動ダウンロード（download_file_contentで全シート取得）
+    GDRIVE_LOCAL_CACHE = Path.home() / "Documents" / "agent" / "セミナー企画書.xlsx"
+
     if args.xlsx:
         xlsx = args.xlsx
+    elif GDRIVE_LOCAL_CACHE.exists():
+        xlsx = str(GDRIVE_LOCAL_CACHE)
+        print(f"[企画書] ローカルキャッシュを使用: {xlsx}")
     else:
-        env_path = os.environ.get("SEMINAR_KIKAKUSHO_PATH")
-        if env_path and Path(env_path).exists():
-            xlsx = env_path
-            print(f"[企画書] 環境変数から取得: {xlsx}")
-        else:
+        # Google Driveから自動ダウンロード
+        file_id = args.gdrive_file_id
+        print(f"[企画書] Google Driveからダウンロード中... (file_id: {file_id})")
+        try:
+            xlsx = _download_gdrive_xlsx(file_id, str(GDRIVE_LOCAL_CACHE))
+            print(f"[企画書] ダウンロード完了: {xlsx}")
+        except Exception as e:
             xlsx = next((find_file(p) for p in XLSX_PATTERNS if find_file(p)), None)
+            if not xlsx:
+                print(f"[エラー] 企画書の取得に失敗しました: {e}")
+                print("  対処法: ~/Documents/agent/セミナー企画書.xlsx に企画書を配置するか --xlsx で直接指定してください")
+                sys.exit(1)
+
     docx = args.docx or find_file(DOCX_PATTERN.format(N=n))
     pptx = args.pptx or find_file(PPTX_PATTERN.format(N=n))
 
