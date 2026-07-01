@@ -54,6 +54,21 @@ Claude Codeでの自動実行:
     契約（契約数・契約率）/
     単価（リード単価・商談単価・TR単価）
 
+[ミス #11] 司会（アナウンサー）に長いスクリプトを書いた
+  発生：第21回台本生成時
+  原因：羽生みな美さん（外注アナウンサー）の役割を理解せず、
+        「まず一つ聞いてもいいですか。今日ここにいらっしゃる方の中で〜」のような
+        長い問いかけ・語りかけ・アジェンダ読み上げ・まとめ読み上げを書いてしまった
+  ルール（絶対守ること）：
+        ・羽生さんのセリフは最低限の合いの手のみ
+        ・「では始めます」「大沢さんお願いします」「ありがとうございます」程度の一言のみ
+        ・問いかけ禁止・語りかけ禁止・アジェンダ読み上げ禁止・まとめ読み上げ禁止
+        ・内容を話すのは全て登壇者（澤居・大沢・森永）の役割
+  再発防止：
+        ・台本生成前に必ず過去回（第9回以降）の台本から羽生さんパートを参照して踏襲する
+        ・いきなり新しいボリュームや表現を持たせない
+        ・check_agentで「羽生」「司会」のセリフが30文字を超えたら[高]severityで警告する
+
 [ミス #7] 企画書シートのURLからgidを取得したがシートを特定できなかった
   発生：2026/7/1 第23回企画書読み込み時
   原因：read_file_contentにgidを渡しても無視される。複数回試みて時間を浪費した
@@ -735,6 +750,62 @@ def notify_slack(webhook_url: str, result: dict, session_label: str, files: dict
 # 5. 文字数の事前設計・事後チェック（台本生成の継ぎ足しループ防止）
 # ─────────────────────────────────────────────
 
+def check_mc_script_length(script_text: str, max_chars: int = 30) -> list[dict]:
+    """
+    司会（羽生さん）のセリフが長すぎないかチェックする。
+    ミス#11の再発防止：司会は一言ブリッジのみ。30文字を超えたら警告。
+
+    引数:
+        script_text: 台本全文
+        max_chars: 1セリフの最大文字数（デフォルト30文字）
+
+    戻り値:
+        [{"severity": "高", "description": "羽生さんのセリフが長すぎます..."}, ...]
+    """
+    import re
+    issues = []
+
+    # 羽生・司会パートのセリフを抽出
+    # 「🟩 羽生：〜」の直後の行を取得
+    lines = script_text.split('\n')
+    in_mc = False
+    current_label = ''
+    current_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        # 羽生・司会ラベル行
+        if re.search(r'🟩.*(羽生|司会)', stripped):
+            # 前のパートをチェック
+            if current_lines:
+                full_text = ''.join(current_lines)
+                # 「」内のセリフ部分だけ計測
+                speech = re.findall(r'「([^」]+)」', full_text)
+                for s in speech:
+                    if len(s) > max_chars:
+                        issues.append({
+                            'severity': '高',
+                            'description': (
+                                f"司会（{current_label}）のセリフが{len(s)}文字あります（上限{max_chars}文字）。"
+                                f"「{s[:20]}…」"
+                                f" → 一言ブリッジに短縮してください（ミス#11）"
+                            )
+                        })
+            in_mc = True
+            current_label = stripped
+            current_lines = []
+        elif in_mc:
+            # 他の登壇者・スライド指示が来たら終了
+            if re.search(r'(🟦|📊|⚠️|📝)', stripped):
+                in_mc = False
+                current_label = ''
+                current_lines = []
+            elif stripped:
+                current_lines.append(stripped)
+
+    return issues
+
+
 def calculate_target_chars(agenda_data: dict, chars_per_minute: int = 400) -> dict:
     """
     企画書のアジェンダ（各章の分数）から、各章の目標文字数を逆算する。
@@ -922,6 +993,15 @@ def main():
             print(f"  [{iss['severity']}] {iss['description']}")
     elif char_targets.get("sections"):
         print(f"[文字数チェック] ✅ 全章とも目標分量の範囲内（目標合計{char_targets['total_target_chars']}字）")
+
+    # 司会セリフ長チェック（ミス#11再発防止）
+    mc_issues = check_mc_script_length(script_text)
+    if mc_issues:
+        print(f"[司会セリフチェック] ⚠️ {len(mc_issues)}件：司会のセリフが長すぎます（ミス#11）")
+        for iss in mc_issues:
+            print(f"  [{iss['severity']}] {iss['description']}")
+    else:
+        print("[司会セリフチェック] ✅ 司会のセリフは全て適切な長さです")
 
     # Claude API でチェック
     print("[2/3] Claude API でチェック中...")
